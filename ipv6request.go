@@ -723,8 +723,16 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Check if this is the daemon child process before parsing flags
+	for _, arg := range os.Args[1:] {
+		if arg == "--daemon-child" {
+			runDaemonServer()
+			return
+		}
+	}
+
 	// Parse command-line flags
-	daemon := flag.Bool("d", false, "Run as daemon (background process)")
+	daemon := flag.Bool("d", false, "Run as daemon (background process on IPv6 localhost)")
 	port := flag.String("port", "8080", "Port to listen on")
 	flag.Parse()
 
@@ -738,9 +746,12 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
+	// Normal mode - bind to all interfaces
+	bindAddr := ":" + *port
+
 	// Start HTTP server in a goroutine
 	server := &http.Server{
-		Addr:    ":" + *port,
+		Addr:    bindAddr,
 		Handler: nil,
 	}
 
@@ -767,26 +778,76 @@ func main() {
 	log.Println("Server stopped")
 }
 
-// runAsDaemon forks the process and runs it in the background
+// runAsDaemon forks the process and runs it in the background on IPv6 localhost
 func runAsDaemon() {
 	// Create a new process group to detach from parent
 	if os.Getppid() != 1 {
-		// Re-execute the program without the -d flag
+		// Re-execute the program without the -d flag, but pass a special flag to indicate daemon child
 		args := []string{}
 		for _, arg := range os.Args[1:] {
 			if arg != "-d" {
 				args = append(args, arg)
 			}
 		}
+		args = append(args, "--daemon-child")
 
 		cmd := exec.Command(os.Args[0], args...)
 		cmd.Start()
-		log.Printf("Started daemon process with PID: %d", cmd.Process.Pid)
+		log.Printf("Started daemon process with PID: %d (IPv6 localhost only)", cmd.Process.Pid)
 		os.Exit(0)
 	}
 
-	// This is the daemon process
-	log.Println("Running as daemon...")
+	// This is the daemon process - run the main server logic with IPv6 binding
+	runDaemonServer()
+}
+
+// runDaemonServer runs the HTTP server bound to IPv6 localhost
+func runDaemonServer() {
+	log.Println("Running as daemon on IPv6 localhost...")
+
+	// Extract port from command line args, default to 8080
+	port := "8080"
+	for i, arg := range os.Args[1:] {
+		if arg == "-port" && i+1 < len(os.Args[1:]) {
+			port = os.Args[i+2]
+			break
+		}
+	}
+
+	// Set up signal handling for graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// Bind only to IPv6 localhost
+	bindAddr := "[::1]:" + port
+
+	// Start HTTP server in a goroutine
+	server := &http.Server{
+		Addr:    bindAddr,
+		Handler: nil,
+	}
+
+	http.HandleFunc("/", formHandler)
+
+	go func() {
+		log.Printf("Daemon server starting on IPv6 localhost port %s...", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed to start: %v", err)
+		}
+	}()
+
+	// Wait for signal
+	<-c
+	log.Println("Received interrupt signal, shutting down gracefully...")
+
+	// Graceful shutdown with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+	log.Println("Server stopped")
 
 	// Redirect stdout and stderr to log file (optional)
 	// You can uncomment this if you want to log to a file
